@@ -4,21 +4,29 @@ mod context;
 pub(crate) mod env;
 mod error;
 
-use crate::error::{exec_bail, VMResult};
-use crate::execution::Compiler;
-use crate::middlewares::gas_calibration::{get_gas_calibration_result, GasCalibrationResult};
-use crate::middlewares::{dumper::Dumper, gas_calibration::GasCalibration};
-use crate::settings::max_number_of_pages;
-use crate::tunable_memory::LimitingTunables;
-use crate::{GasCosts, Interface, Response};
-use anyhow::Result;
+use crate::{
+    error::{exec_bail, VMResult},
+    execution::Compiler,
+    middlewares::{
+        condom::CondomMiddleware,
+        dumper::Dumper,
+        gas_calibration::{get_gas_calibration_result, GasCalibration, GasCalibrationResult},
+    },
+    settings::max_number_of_pages,
+    tunable_memory::LimitingTunables,
+    CondomLimits, GasCosts, Interface, Response, VMError,
+};
 use std::sync::Arc;
-use wasmer::NativeEngineExt;
-use wasmer::{wasmparser::Operator, BaseTunables, Engine, EngineBuilder, Pages, Target};
-use wasmer::{CompilerConfig, Cranelift, Features, Module, Store};
+use wasmer::{
+    sys::{BaseTunables, EngineBuilder, Features},
+    wasmparser::Operator,
+    CompilerConfig, Cranelift, Engine, Module, NativeEngineExt, Pages, Store, Target,
+};
 use wasmer_compiler_singlepass::Singlepass;
-use wasmer_middlewares::metering::MeteringPoints;
-use wasmer_middlewares::{metering, Metering};
+use wasmer_middlewares::{
+    metering::{self, MeteringPoints},
+    Metering,
+};
 
 pub(crate) use context::*;
 pub(crate) use error::*;
@@ -39,36 +47,50 @@ impl ASModule {
         limit: u64,
         gas_costs: GasCosts,
         compiler: Compiler,
-    ) -> Result<Self> {
+        condom_limits: CondomLimits,
+    ) -> VMResult<Self> {
         let engine = match compiler {
-            Compiler::CL => init_cl_engine(limit, gas_costs),
-            Compiler::SP => init_sp_engine(limit, gas_costs),
+            Compiler::CL => init_cl_engine(limit, gas_costs, condom_limits),
+            Compiler::SP => init_sp_engine(limit, gas_costs, condom_limits),
         };
         Ok(Self {
-            binary_module: Module::new(&engine, bytecode)?,
+            binary_module: Module::new(&engine, bytecode)
+                .map_err(|e| VMError::InstanceError(e.to_string()))?,
             initial_limit: limit,
             compiler,
             _engine: engine,
         })
     }
 
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    pub fn serialize(&self) -> VMResult<Vec<u8>> {
         match self.compiler {
-            Compiler::CL => Ok(self.binary_module.serialize()?.to_vec()),
+            Compiler::CL => Ok(self
+                .binary_module
+                .serialize()
+                .map_err(|e| VMError::InstanceError(e.to_string()))?
+                .to_vec()),
             Compiler::SP => {
                 panic!("cannot serialize a module compiled with Singlepass")
             }
         }
     }
 
-    pub fn deserialize(ser_module: &[u8], limit: u64, gas_costs: GasCosts) -> Result<Self> {
+    pub fn deserialize(
+        ser_module: &[u8],
+        limit: u64,
+        gas_costs: GasCosts,
+        condom_limits: CondomLimits,
+    ) -> VMResult<Self> {
         // Deserialization is only meant for Cranelift modules
-        let engine = init_cl_engine(limit, gas_costs);
+        let engine = init_cl_engine(limit, gas_costs, condom_limits);
         let store = Store::new(engine.clone());
         // Unsafe because code injection is possible
         // That's not an issue because we only deserialize modules we have
         // serialized by ourselves before
-        let module = unsafe { Module::deserialize(&store, ser_module)? };
+        let module = unsafe {
+            Module::deserialize(&store, ser_module)
+                .map_err(|e| VMError::InstanceError(e.to_string()))?
+        };
         Ok(ASModule {
             binary_module: module,
             initial_limit: limit,
@@ -111,7 +133,11 @@ const FEATURES: Features = Features {
     extended_const: false,  // experimental
 };
 
-pub(crate) fn init_sp_engine(limit: u64, gas_costs: GasCosts) -> Engine {
+pub(crate) fn init_sp_engine(
+    limit: u64,
+    gas_costs: GasCosts,
+    condom_limits: CondomLimits,
+) -> Engine {
     // Singlepass is used to compile arbitrary bytecode.
     //
     // Reference:
@@ -120,6 +146,9 @@ pub(crate) fn init_sp_engine(limit: u64, gas_costs: GasCosts) -> Engine {
 
     // Canonicalize NaN
     compiler_config.canonicalize_nans(true);
+
+    // Add condom middleware
+    compiler_config.push_middleware(Arc::new(CondomMiddleware::new(condom_limits)));
 
     if cfg!(feature = "gas_calibration") {
         // Add gas calibration middleware
@@ -145,7 +174,11 @@ pub(crate) fn init_sp_engine(limit: u64, gas_costs: GasCosts) -> Engine {
     engine
 }
 
-pub(crate) fn init_cl_engine(limit: u64, gas_costs: GasCosts) -> Engine {
+pub(crate) fn init_cl_engine(
+    limit: u64,
+    gas_costs: GasCosts,
+    condom_limits: CondomLimits,
+) -> Engine {
     // Cranelift is used to compile bytecode that will be cached.
     //
     // Reference:
@@ -154,6 +187,9 @@ pub(crate) fn init_cl_engine(limit: u64, gas_costs: GasCosts) -> Engine {
 
     // Canonicalize NaN
     compiler_config.canonicalize_nans(true);
+
+    // Add condom middleware
+    compiler_config.push_middleware(Arc::new(CondomMiddleware::new(condom_limits)));
 
     if cfg!(feature = "gas_calibration") {
         // Add gas calibration middleware
@@ -203,18 +239,26 @@ pub(crate) fn exec_as_module(
     param: &[u8],
     limit: u64,
     gas_costs: GasCosts,
+    condom_limits: CondomLimits,
 ) -> VMResult<(Response, Option<GasCalibrationResult>)> {
     let engine = match as_module.compiler {
-        Compiler::CL => init_cl_engine(limit, gas_costs.clone()),
-        Compiler::SP => init_sp_engine(limit, gas_costs.clone()),
+        Compiler::CL => init_cl_engine(limit, gas_costs.clone(), condom_limits.clone()),
+        Compiler::SP => init_sp_engine(limit, gas_costs.clone(), condom_limits.clone()),
     };
     let mut store = Store::new(engine);
-    let mut context = ASContext::new(interface, as_module.binary_module, gas_costs);
+    let mut context = ASContext::new(
+        interface,
+        as_module.binary_module,
+        gas_costs,
+        condom_limits.clone(),
+    );
 
     // save the gas remaining before sub-execution: used by readonly execution
     interface.save_gas_remaining_before_subexecution(limit);
 
-    let (instance, _fenv, init_rem_points) = context.create_vm_instance_and_init_env(&mut store)?;
+    let (instance, _fenv, init_rem_points) = context
+        .create_vm_instance_and_init_env(&mut store)
+        .map_err(|e| VMError::InstanceError(e.to_string()))?;
     let init_cost = as_module.initial_limit.saturating_sub(init_rem_points);
 
     if cfg!(not(feature = "gas_calibration")) {
@@ -241,15 +285,24 @@ pub(crate) fn exec_as_module(
             if cfg!(feature = "gas_calibration") {
                 exec_bail!(err, init_cost)
             } else {
-                // Because the last needed more than the remaining points, we
-                // should have an error.
-                match metering::get_remaining_points(&mut store, &instance) {
-                    MeteringPoints::Remaining(..) => exec_bail!(err, init_cost),
-                    MeteringPoints::Exhausted => {
-                        exec_bail!(
-                            format!("Not enough gas, limit reached at: {function}"),
-                            init_cost
-                        )
+                // some error need to be handled carefully (depth error)
+                // hence we match on the error type to handle specific cases
+                match err {
+                    VMError::DepthError(e) => Err(VMError::DepthError(e)),
+                    _ => {
+                        // Because the last needed more than the remaining points, we
+                        // should have an error.
+                        match metering::get_remaining_points(&mut store, &instance) {
+                            MeteringPoints::Remaining(..) => {
+                                exec_bail!(err, init_cost)
+                            }
+                            MeteringPoints::Exhausted => {
+                                exec_bail!(
+                                    format!("Not enough gas, limit reached at: {function}"),
+                                    init_cost
+                                )
+                            }
+                        }
                     }
                 }
             }
